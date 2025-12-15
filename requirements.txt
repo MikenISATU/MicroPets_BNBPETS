@@ -1,0 +1,8 @@
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-telegram-bot==20.7
+web3==6.15.1
+tenacity==8.2.3
+python-dotenv==1.0.0
+requests==2.31.0
+httpx==0.26.0
