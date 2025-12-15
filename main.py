@@ -1639,13 +1639,11 @@ async def lifespan(app: FastAPI):
         await bot_app.initialize()
         try:
             await set_webhook_with_retry(bot_app)
-            monitoring_task = asyncio.create_task(monitor_transactions(bot_app))
-            logger.info("Webhook set successfully")
+            logger.info("Webhook set successfully, monitoring will start with /track command")
         except Exception as e:
             logger.error(f"Webhook setup failed: {e}. Switching to polling")
             polling_task = asyncio.create_task(polling_fallback(bot_app))
-            monitoring_task = asyncio.create_task(monitor_transactions(bot_app))
-            logger.info("Polling started, monitoring enabled")
+            logger.info("Polling started, monitoring will start with /track command")
         logger.info("Bot startup completed")
         yield
     except Exception as e:
