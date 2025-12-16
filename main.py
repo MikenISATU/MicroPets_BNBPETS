@@ -42,7 +42,7 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CLOUDINARY_CLOUD_NAME = os.getenv('CLOUDINARY_CLOUD_NAME')
 APP_URL = os.getenv('RAILWAY_PUBLIC_DOMAIN', os.getenv('APP_URL'))
-ETHERSCAN_API_KEY = os.getenv('ETHERSCAN_API_KEY')  # unused, kept for compatibility/debug
+BSCSCAN_API_KEY = os.getenv('ETHERSCAN_API_KEY', os.getenv('BSCSCAN_API_KEY', ''))  # v2 unified API works for both
 
 # Default RPC → Ankr node, but can still be overridden by BNB_RPC_URL in Railway
 BNB_RPC_URL = os.getenv(
@@ -84,6 +84,12 @@ for addr, name in [(CONTRACT_ADDRESS, 'CONTRACT_ADDRESS'), (TARGET_ADDRESS, 'TAR
 
 if not COINMARKETCAP_API_KEY:
     logger.warning("COINMARKETCAP_API_KEY is empty; CoinMarketCap API calls will be skipped")
+
+if not BSCSCAN_API_KEY:
+    logger.warning("⚠️ BSCSCAN_API_KEY is empty; will use Web3 RPC only (less reliable, may hit rate limits)")
+    logger.warning("💡 Get a FREE BscScan API key at: https://bscscan.com/myapikey")
+else:
+    logger.info(f"✅ BscScan API key configured: {BSCSCAN_API_KEY[:10]}... (FREE tier: 5 calls/sec)")
 
 logger.info(f"Environment loaded successfully. APP_URL={APP_URL}, PORT={PORT}")
 
@@ -169,7 +175,9 @@ class RateLimiter:
                     time.sleep(self.min_interval - elapsed)
             self.last_call[key] = now
 
-api_limiter = RateLimiter(calls_per_second=0.1)
+# Rate limiters for different APIs
+api_limiter = RateLimiter(calls_per_second=0.1)  # For GeckoTerminal etc
+bscscan_limiter = RateLimiter(calls_per_second=4.0)  # BscScan FREE tier: 5/sec (use 4 to be safe)
 
 # In-memory data
 transaction_cache: List[Dict] = []
@@ -247,6 +255,82 @@ def get_block_timestamp(block_number: int) -> int:
     except Exception as e:
         logger.error(f"Failed to get block timestamp for {block_number}: {e}")
         return int(time.time())
+
+@retry(wait=wait_exponential(multiplier=2, min=2, max=10), stop=stop_after_attempt(3))
+def fetch_transactions_via_bscscan_api(startblock: int, endblock: int) -> List[Dict]:
+    """
+    Fetch token transfers from BscScan API using tokentx endpoint.
+
+    BscScan FREE tier:
+    - 5 calls/second
+    - 100,000 calls/day
+    - Works with ETHERSCAN_API_KEY (v2 unified API)
+
+    Returns transactions where FROM == TARGET_ADDRESS (LP address).
+    """
+    if not BSCSCAN_API_KEY:
+        logger.warning("BscScan API key not configured, skipping API call")
+        return []
+
+    bscscan_limiter.wait("tokentx")
+
+    url = "https://api.bscscan.com/api"
+    params = {
+        'module': 'account',
+        'action': 'tokentx',
+        'contractaddress': CONTRACT_ADDRESS,
+        'address': TARGET_ADDRESS,  # Filter by LP address
+        'startblock': startblock,
+        'endblock': endblock,
+        'page': 1,
+        'offset': 10000,  # Max 10k results per call
+        'sort': 'desc',  # Newest first
+        'apikey': BSCSCAN_API_KEY
+    }
+
+    try:
+        logger.info(f"📡 BscScan API: Fetching tokentx from block {startblock} to {endblock}")
+        response = requests.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get('status') != '1':
+            error_msg = data.get('message', 'Unknown error')
+            if 'rate limit' in error_msg.lower():
+                logger.error(f"BscScan rate limit hit: {error_msg}")
+                time.sleep(1)  # Back off
+                raise Exception("Rate limit exceeded")
+            logger.warning(f"BscScan API returned status != 1: {error_msg}")
+            return []
+
+        results = data.get('result', [])
+
+        # Filter to only transfers FROM the LP address (buys)
+        transactions = []
+        for tx in results:
+            # BscScan returns lowercase addresses
+            if tx.get('from', '').lower() == TARGET_ADDRESS.lower():
+                transactions.append({
+                    'transactionHash': tx['hash'],
+                    'from': Web3.to_checksum_address(tx['from']),
+                    'to': Web3.to_checksum_address(tx['to']),
+                    'value': tx['value'],
+                    'blockNumber': int(tx['blockNumber']),
+                    'timeStamp': int(tx['timeStamp'])
+                })
+
+        logger.info(f"✅ BscScan API: Found {len(transactions)} buy transactions (from {len(results)} total transfers)")
+        return transactions
+
+    except requests.exceptions.Timeout:
+        logger.error("BscScan API timeout")
+        raise
+    except requests.exceptions.RequestException as e:
+        logger.error(f"BscScan API request failed: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"BscScan API error: {e}")
+        raise
 
 def fetch_transactions_window(from_block: int, to_block: int, retries: int = 3) -> List[Dict]:
     """
@@ -663,34 +747,54 @@ def get_balance_before_transaction(wallet_address: str, block_number: int) -> Op
         logger.error(f"Failed to fetch balance via Web3: {e}")
         return None
 
-@retry(wait=wait_exponential(multiplier=2, min=4, max=20), stop=stop_after_attempt(3))
 def fetch_bscscan_transactions(startblock: Optional[int] = None,
                                endblock: Optional[int] = None) -> List[Dict]:
     """
-    Fetch buy transactions via Web3 logs (no Etherscan).
-    Uses windowed scanning for [startblock, endblock].
+    Fetch buy transactions using BscScan API (preferred) or Web3 RPC (fallback).
+
+    Priority:
+    1. BscScan API (reliable, fast, free tier)
+    2. Web3 RPC logs (slower, rate limits)
     """
     global transaction_cache, last_transaction_fetch, last_block_number
+
     try:
         current_block = w3.eth.block_number
-        
+
         # If this is the first run, start from recent blocks only
         if last_block_number is None and startblock is None:
             startblock = current_block - (LOG_WINDOW_SIZE * 2)  # Only scan last ~400 blocks on first run
-            logger.info(f"First run: starting from block {startblock} (current: {current_block})")
+            logger.info(f"🚀 First run: starting from block {startblock} (current: {current_block})")
         elif not startblock and last_block_number:
             startblock = last_block_number + 1
-        
+
         if endblock is None:
-            txs = fetch_transactions_via_web3(from_block=startblock, to_block=None)
-        else:
-            if startblock is None:
-                startblock = max(1, endblock - LOG_WINDOW_SIZE)
+            endblock = current_block
+
+        if startblock is None:
+            startblock = max(1, endblock - LOG_WINDOW_SIZE)
+
+        # Try BscScan API first if API key is available
+        txs = []
+        if BSCSCAN_API_KEY:
+            try:
+                logger.info(f"🔍 Using BscScan API (preferred method)")
+                txs = fetch_transactions_via_bscscan_api(startblock, endblock)
+            except Exception as api_error:
+                logger.warning(f"BscScan API failed: {api_error}, falling back to Web3 RPC")
+                txs = []
+
+        # Fallback to Web3 RPC if BscScan API failed or no API key
+        if not txs and not BSCSCAN_API_KEY:
+            logger.info(f"⚠️ No BscScan API key, using Web3 RPC (slower, may hit rate limits)")
+            txs = fetch_transactions_via_web3(from_block=startblock, to_block=endblock)
+        elif not txs:
+            logger.info(f"🔄 Falling back to Web3 RPC")
             txs = fetch_transactions_via_web3(from_block=startblock, to_block=endblock)
 
-        # Add timestamps
+        # Ensure timestamps are present
         for tx in txs:
-            if 'blockNumber' in tx:
+            if 'blockNumber' in tx and 'timeStamp' not in tx:
                 tx['timeStamp'] = get_block_timestamp(tx['blockNumber'])
 
         if txs:
@@ -698,11 +802,11 @@ def fetch_bscscan_transactions(startblock: Optional[int] = None,
             transaction_cache = (transaction_cache + txs)[-1000:]
             last_transaction_fetch = datetime.now().timestamp() * 1000
 
-        logger.info(f"Fetched {len(txs)} buy transactions via Web3, last_block_number={last_block_number}")
+        logger.info(f"✅ Fetched {len(txs)} buy transactions, last_block_number={last_block_number}")
         return txs
 
     except Exception as e:
-        logger.error(f"Failed to fetch transactions via Web3: {e}")
+        logger.error(f"❌ Failed to fetch transactions: {e}")
         return transaction_cache or []
 
 async def send_video_with_retry(context, chat_id: str, video_url: str, options: Dict, max_retries: int = 3, delay: int = 2) -> bool:
@@ -866,38 +970,38 @@ async def set_webhook_with_retry(bot_app) -> bool:
         raise
 
 async def polling_fallback(bot_app) -> None:
+    """Start polling mode if webhook setup fails."""
     global polling_task
-    logger.info("Starting polling fallback")
-    while True:
-        try:
-            if not bot_app.running:
-                await bot_app.initialize()
-                await bot_app.start()
+    logger.info("🔄 Starting polling fallback mode")
+
+    try:
+        # Start polling
+        await bot_app.updater.start_polling(
+            poll_interval=3,
+            timeout=10,
+            drop_pending_updates=True,
+            error_callback=lambda e: logger.error(f"Polling error: {e}")
+        )
+        logger.info("✅ Polling started successfully - bot is now active")
+
+        # Keep polling alive until task is cancelled
+        while True:
+            await asyncio.sleep(60)
+            if not bot_app.updater.running:
+                logger.warning("⚠️ Updater stopped, restarting...")
                 await bot_app.updater.start_polling(
                     poll_interval=3,
                     timeout=10,
                     drop_pending_updates=True,
                     error_callback=lambda e: logger.error(f"Polling error: {e}")
                 )
-                logger.info("Polling started successfully")
-                while polling_task and not polling_task.cancelled():
-                    await asyncio.sleep(60)
-            else:
-                logger.warning("Bot already running, skipping polling start")
-                while polling_task and not polling_task.cancelled():
-                    await asyncio.sleep(60)
-        except Exception as e:
-            logger.error(f"Polling error: {e}")
-            await asyncio.sleep(10)
-        finally:
-            if bot_app.running and polling_task and polling_task.cancelled():
-                try:
-                    await bot_app.updater.stop()
-                    await bot_app.stop()
-                    await bot_app.shutdown()
-                    logger.info("Polling stopped")
-                except Exception as e:
-                    logger.error(f"Error stopping polling: {e}")
+    except asyncio.CancelledError:
+        logger.info("🛑 Polling task cancelled")
+        raise
+    except Exception as e:
+        logger.error(f"❌ Fatal polling error: {e}")
+        await asyncio.sleep(10)
+        raise
 
 async def handle_message(update: Update, context) -> None:
     """
@@ -1633,49 +1737,110 @@ async def no_video(update: Update, context) -> None:
 # Lifespan handler
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    FastAPI lifespan handler - manages bot initialization and keeps app running.
+    """
     global monitoring_task, polling_task
-    logger.info("Starting bot application")
+
+    logger.info("="*60)
+    logger.info("🚀 Starting MicroPets BNBPETS Tracker Bot")
+    logger.info("="*60)
+
+    # Initialization phase
     try:
         await bot_app.initialize()
-        try:
-            await set_webhook_with_retry(bot_app)
-            logger.info("Webhook set successfully, monitoring will start with /track command")
-        except Exception as e:
-            logger.error(f"Webhook setup failed: {e}. Switching to polling")
+        await bot_app.start()
+        logger.info("✅ Bot initialized successfully")
+
+        # Try webhook first, fallback to polling
+        webhook_success = False
+        if APP_URL:
+            try:
+                await set_webhook_with_retry(bot_app)
+                webhook_success = True
+                logger.info("✅ Webhook mode active - bot ready for commands")
+                logger.info(f"📡 Webhook URL: https://{APP_URL}/webhook")
+            except Exception as e:
+                logger.error(f"❌ Webhook setup failed: {e}")
+                webhook_success = False
+
+        if not webhook_success:
+            logger.info("🔄 Starting polling mode as fallback")
             polling_task = asyncio.create_task(polling_fallback(bot_app))
-            logger.info("Polling started, monitoring will start with /track command")
-        logger.info("Bot startup completed")
+            logger.info("✅ Polling mode active - bot ready for commands")
+
+        logger.info("="*60)
+        logger.info("📱 Bot Commands:")
+        logger.info("   /track - Start monitoring transactions")
+        logger.info("   /stop  - Stop monitoring")
+        logger.info("   /help  - Show all commands")
+        logger.info("="*60)
+        logger.info("✨ Bot is now running and waiting for commands...")
+        logger.info("💡 Use /track to start transaction monitoring")
+        logger.info("="*60)
+
+        # Yield to keep app running
         yield
+
     except Exception as e:
-        logger.error(f"Startup error: {e}")
+        logger.error(f"❌ Fatal startup error: {e}")
+        raise
+
+    # Shutdown phase
     finally:
-        logger.info("Initiating bot shutdown...")
+        logger.info("="*60)
+        logger.info("🛑 Initiating bot shutdown...")
+        logger.info("="*60)
+
         try:
-            if monitoring_task:
+            # Cancel monitoring task
+            if monitoring_task and not monitoring_task.done():
+                logger.info("Stopping monitoring task...")
                 monitoring_task.cancel()
                 try:
                     await monitoring_task
                 except asyncio.CancelledError:
-                    logger.info("Monitoring task cancelled")
+                    logger.info("✅ Monitoring task stopped")
                 monitoring_task = None
-            if polling_task:
+
+            # Cancel polling task
+            if polling_task and not polling_task.done():
+                logger.info("Stopping polling task...")
                 polling_task.cancel()
                 try:
                     await polling_task
                 except asyncio.CancelledError:
-                    logger.info("Polling task cancelled")
+                    logger.info("✅ Polling task stopped")
                 polling_task = None
+
+            # Stop bot
             if bot_app.running:
+                logger.info("Stopping bot updater...")
                 try:
-                    await bot_app.updater.stop()
+                    if bot_app.updater and bot_app.updater.running:
+                        await bot_app.updater.stop()
                     await bot_app.stop()
+                    logger.info("✅ Bot stopped")
                 except Exception as e:
                     logger.error(f"Error stopping bot: {e}")
-            await bot_app.bot.delete_webhook(drop_pending_updates=True)
+
+            # Clean up webhook
+            try:
+                await bot_app.bot.delete_webhook(drop_pending_updates=True)
+                logger.info("✅ Webhook deleted")
+            except Exception as e:
+                logger.error(f"Error deleting webhook: {e}")
+
+            # Shutdown bot
             await bot_app.shutdown()
-            logger.info("Bot shutdown completed")
+            logger.info("✅ Bot shutdown completed")
+
+            logger.info("="*60)
+            logger.info("👋 Bot stopped gracefully")
+            logger.info("="*60)
+
         except Exception as e:
-            logger.error(f"Shutdown error: {str(e)}")
+            logger.error(f"❌ Shutdown error: {e}")
 
 # FastAPI app with lifespan
 app = FastAPI(lifespan=lifespan)
