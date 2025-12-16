@@ -88,8 +88,27 @@ if not COINMARKETCAP_API_KEY:
 if not BSCSCAN_API_KEY:
     logger.warning("⚠️ BSCSCAN_API_KEY is empty; will use Web3 RPC only (less reliable, may hit rate limits)")
     logger.warning("💡 Get a FREE BscScan API key at: https://bscscan.com/myapikey")
+    logger.warning("💡 Set ETHERSCAN_API_KEY in Railway environment variables (works for BscScan too)")
 else:
     logger.info(f"✅ BscScan API key configured: {BSCSCAN_API_KEY[:10]}... (FREE tier: 5 calls/sec)")
+    # Test API key validity
+    try:
+        test_url = "https://api.bscscan.com/api"
+        test_params = {
+            'module': 'account',
+            'action': 'balance',
+            'address': CONTRACT_ADDRESS,
+            'apikey': BSCSCAN_API_KEY
+        }
+        test_response = requests.get(test_url, params=test_params, timeout=5)
+        test_data = test_response.json()
+        if test_data.get('status') == '1':
+            logger.info(f"✅ BscScan API key validated successfully")
+        else:
+            logger.error(f"❌ BscScan API key validation failed: {test_data.get('message', 'Unknown error')}")
+            logger.error(f"⚠️ Will fall back to Web3 RPC for transaction fetching")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not validate BscScan API key: {e}")
 
 logger.info(f"Environment loaded successfully. APP_URL={APP_URL}, PORT={PORT}")
 
@@ -296,12 +315,36 @@ def fetch_transactions_via_bscscan_api(startblock: int, endblock: int) -> List[D
 
         if data.get('status') != '1':
             error_msg = data.get('message', 'Unknown error')
+            result = data.get('result', '')
+
+            # Log detailed error information
+            logger.error(f"❌ BscScan API Error:")
+            logger.error(f"   Status: {data.get('status')}")
+            logger.error(f"   Message: {error_msg}")
+            logger.error(f"   Result: {result}")
+            logger.error(f"   API Key Present: {'Yes' if BSCSCAN_API_KEY else 'No'}")
+            logger.error(f"   API Key (first 10 chars): {BSCSCAN_API_KEY[:10] if BSCSCAN_API_KEY else 'N/A'}")
+
+            # Handle rate limits
             if 'rate limit' in error_msg.lower():
-                logger.error(f"BscScan rate limit hit: {error_msg}")
+                logger.error(f"🚫 BscScan rate limit hit: {error_msg}")
                 time.sleep(1)  # Back off
                 raise Exception("Rate limit exceeded")
-            logger.warning(f"BscScan API returned status != 1: {error_msg}")
-            return []
+
+            # Handle missing/invalid API key
+            if 'invalid' in error_msg.lower() or 'missing' in error_msg.lower():
+                logger.error(f"🔑 BscScan API key issue: {error_msg}")
+                logger.error(f"💡 Get a FREE API key at: https://bscscan.com/myapikey")
+                raise Exception(f"Invalid or missing API key: {error_msg}")
+
+            # Handle max block range exceeded
+            if 'result window' in error_msg.lower() or 'exceed' in error_msg.lower():
+                logger.error(f"📊 Block range too large: {error_msg}")
+                raise Exception(f"Block range exceeded: {error_msg}")
+
+            # Generic error
+            logger.warning(f"⚠️ BscScan API returned error: {error_msg}")
+            raise Exception(f"BscScan API error: {error_msg}")
 
         results = data.get('result', [])
 
@@ -363,9 +406,10 @@ def fetch_transactions_window(from_block: int, to_block: int, retries: int = 3) 
         try:
             # Use the contract event's get_logs() with argument_filters
             # This is the recommended Web3.py approach and handles all encoding automatically
+            # Note: Web3.py v6+ uses snake_case (from_block, to_block)
             logs = token_event_contract.events.Transfer.get_logs(
-                fromBlock=from_block,
-                toBlock=to_block,
+                from_block=from_block,
+                to_block=to_block,
                 argument_filters={'from': checksummed_target}
             )
 
