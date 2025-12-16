@@ -43,6 +43,7 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CLOUDINARY_CLOUD_NAME = os.getenv('CLOUDINARY_CLOUD_NAME')
 APP_URL = os.getenv('RAILWAY_PUBLIC_DOMAIN', os.getenv('APP_URL'))
 BSCSCAN_API_KEY = os.getenv('ETHERSCAN_API_KEY', os.getenv('BSCSCAN_API_KEY', ''))  # v2 unified API works for both
+MORALIS_API_KEY = os.getenv('MORALIS_API_KEY', '')  # FREE alternative: https://moralis.io
 
 # Default RPC → Ankr node, but can still be overridden by BNB_RPC_URL in Railway
 BNB_RPC_URL = os.getenv(
@@ -85,11 +86,22 @@ for addr, name in [(CONTRACT_ADDRESS, 'CONTRACT_ADDRESS'), (TARGET_ADDRESS, 'TAR
 if not COINMARKETCAP_API_KEY:
     logger.warning("COINMARKETCAP_API_KEY is empty; CoinMarketCap API calls will be skipped")
 
-if not BSCSCAN_API_KEY:
-    logger.warning("⚠️ BSCSCAN_API_KEY is empty; will use Web3 RPC only (less reliable, may hit rate limits)")
-    logger.warning("💡 Get a FREE BscScan API key at: https://bscscan.com/myapikey")
-    logger.warning("💡 Set ETHERSCAN_API_KEY in Railway environment variables (works for BscScan too)")
-else:
+if not BSCSCAN_API_KEY and not MORALIS_API_KEY:
+    logger.error("="*60)
+    logger.error("⚠️ No API keys configured!")
+    logger.error("="*60)
+    logger.error("🔑 Get a FREE API key from either:")
+    logger.error("   Option 1 (Recommended): BscScan")
+    logger.error("      → https://bscscan.com/register (FREE)")
+    logger.error("      → Set: ETHERSCAN_API_KEY=YourKey")
+    logger.error("      → Free tier: 5 calls/sec, 100k/day")
+    logger.error("")
+    logger.error("   Option 2: Moralis")
+    logger.error("      → https://moralis.io (FREE)")
+    logger.error("      → Set: MORALIS_API_KEY=YourKey")
+    logger.error("      → Free tier: 40k compute units/day")
+    logger.error("="*60)
+elif BSCSCAN_API_KEY:
     logger.info(f"✅ BscScan API key configured: {BSCSCAN_API_KEY[:10]}... (FREE tier: 5 calls/sec)")
     # Test API key validity
     try:
@@ -106,9 +118,14 @@ else:
             logger.info(f"✅ BscScan API key validated successfully")
         else:
             logger.error(f"❌ BscScan API key validation failed: {test_data.get('message', 'Unknown error')}")
-            logger.error(f"⚠️ Will fall back to Web3 RPC for transaction fetching")
+            if MORALIS_API_KEY:
+                logger.info(f"✅ Will use Moralis API as fallback")
     except Exception as e:
         logger.warning(f"⚠️ Could not validate BscScan API key: {e}")
+        if MORALIS_API_KEY:
+            logger.info(f"✅ Will use Moralis API as fallback")
+elif MORALIS_API_KEY:
+    logger.info(f"✅ Moralis API key configured: {MORALIS_API_KEY[:10]}... (FREE tier: 40k compute units/day)")
 
 logger.info(f"Environment loaded successfully. APP_URL={APP_URL}, PORT={PORT}")
 
@@ -274,6 +291,79 @@ def get_block_timestamp(block_number: int) -> int:
     except Exception as e:
         logger.error(f"Failed to get block timestamp for {block_number}: {e}")
         return int(time.time())
+
+@retry(wait=wait_exponential(multiplier=2, min=2, max=10), stop=stop_after_attempt(3))
+def fetch_transactions_via_moralis_api(from_block: int, to_block: int) -> List[Dict]:
+    """
+    Fetch token transfers from Moralis API.
+
+    Moralis FREE tier:
+    - 40,000 compute units/day
+    - Token transfer endpoints
+    - BSC support
+
+    Returns transactions where FROM == TARGET_ADDRESS (LP address).
+    """
+    if not MORALIS_API_KEY:
+        logger.warning("Moralis API key not configured, skipping API call")
+        return []
+
+    api_limiter.wait("moralis")
+
+    url = f"https://deep-index.moralis.io/api/v2.2/{TARGET_ADDRESS}/erc20/transfers"
+    headers = {
+        'Accept': 'application/json',
+        'X-API-Key': MORALIS_API_KEY
+    }
+    params = {
+        'chain': 'bsc',
+        'from_block': from_block,
+        'to_block': to_block,
+        'contract_addresses': [CONTRACT_ADDRESS],
+        'limit': 100  # Max per page
+    }
+
+    try:
+        logger.info(f"📡 Moralis API: Fetching transfers from block {from_block} to {to_block}")
+        response = requests.get(url, headers=headers, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        results = data.get('result', [])
+        transactions = []
+
+        for tx in results:
+            # Filter transfers FROM the LP address (buys)
+            if tx.get('from_address', '').lower() == TARGET_ADDRESS.lower():
+                try:
+                    transactions.append({
+                        'transactionHash': tx['transaction_hash'],
+                        'from': Web3.to_checksum_address(tx['from_address']),
+                        'to': Web3.to_checksum_address(tx['to_address']),
+                        'value': tx['value'],
+                        'blockNumber': int(tx['block_number']),
+                        'timeStamp': int(datetime.fromisoformat(tx['block_timestamp'].replace('Z', '+00:00')).timestamp())
+                    })
+                except Exception as parse_error:
+                    logger.warning(f"Failed to parse Moralis transaction: {parse_error}")
+                    continue
+
+        logger.info(f"✅ Moralis API: Found {len(transactions)} buy transactions (from {len(results)} total transfers)")
+        return transactions
+
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 401:
+            logger.error("❌ Moralis API: Invalid API key")
+            logger.error("💡 Get a FREE key at: https://moralis.io")
+        elif e.response.status_code == 429:
+            logger.error("❌ Moralis API: Rate limit exceeded")
+            time.sleep(2)
+        else:
+            logger.error(f"❌ Moralis API HTTP error: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"❌ Moralis API error: {e}")
+        raise
 
 @retry(wait=wait_exponential(multiplier=2, min=2, max=10), stop=stop_after_attempt(3))
 def fetch_transactions_via_bscscan_api(startblock: int, endblock: int) -> List[Dict]:
@@ -818,31 +908,61 @@ def fetch_bscscan_transactions(startblock: Optional[int] = None,
         if startblock is None:
             startblock = max(1, endblock - LOG_WINDOW_SIZE)
 
-        # Use ONLY BscScan API - it's the only reliable method
+        # Try multiple FREE APIs in priority order
         txs = []
-        if not BSCSCAN_API_KEY:
+
+        # Check if we have any API key
+        if not BSCSCAN_API_KEY and not MORALIS_API_KEY:
             logger.error("="*60)
-            logger.error("❌ CRITICAL: BscScan API key is required!")
+            logger.error("❌ CRITICAL: API key is required!")
             logger.error("="*60)
-            logger.error("🔑 Get a FREE BscScan API key:")
-            logger.error("   1. Go to: https://bscscan.com/myapikey")
-            logger.error("   2. Create account (FREE)")
-            logger.error("   3. Generate API key")
-            logger.error("   4. Add to Railway: ETHERSCAN_API_KEY=YourKey")
+            logger.error("🔑 Choose ONE of these FREE options:")
+            logger.error("")
+            logger.error("   Option 1 (Fastest): BscScan")
+            logger.error("      → https://bscscan.com/register")
+            logger.error("      → Set: ETHERSCAN_API_KEY=YourKey")
+            logger.error("      → FREE: 5 calls/sec, 100k/day")
+            logger.error("")
+            logger.error("   Option 2: Moralis")
+            logger.error("      → https://moralis.io")
+            logger.error("      → Set: MORALIS_API_KEY=YourKey")
+            logger.error("      → FREE: 40k compute units/day")
             logger.error("="*60)
             logger.error("⏸️  Transaction monitoring PAUSED until API key is added")
             logger.error("="*60)
             return []
 
-        try:
-            logger.info(f"📡 Fetching transactions via BscScan API")
-            txs = fetch_transactions_via_bscscan_api(startblock, endblock)
-        except Exception as api_error:
-            logger.error(f"❌ BscScan API failed: {api_error}")
-            logger.error(f"⏸️  Will retry on next polling interval")
-            return []
+        # Try BscScan first (faster, more reliable)
+        if BSCSCAN_API_KEY:
+            try:
+                logger.info(f"📡 Trying BscScan API (primary)")
+                txs = fetch_transactions_via_bscscan_api(startblock, endblock)
+                if txs:
+                    logger.info(f"✅ BscScan API success!")
+            except Exception as bsc_error:
+                logger.warning(f"⚠️ BscScan API failed: {bsc_error}")
+                if MORALIS_API_KEY:
+                    logger.info(f"🔄 Trying Moralis API as fallback...")
+                else:
+                    logger.error(f"❌ No fallback API available")
+                    return []
 
-        # Ensure timestamps are present
+        # Try Moralis (fallback or primary if no BscScan key)
+        if not txs and MORALIS_API_KEY:
+            try:
+                if BSCSCAN_API_KEY:
+                    logger.info(f"📡 Trying Moralis API (fallback)")
+                else:
+                    logger.info(f"📡 Trying Moralis API (primary)")
+                txs = fetch_transactions_via_moralis_api(startblock, endblock)
+                if txs:
+                    logger.info(f"✅ Moralis API success!")
+            except Exception as moralis_error:
+                logger.error(f"❌ Moralis API failed: {moralis_error}")
+                logger.error(f"⏸️  Will retry on next polling interval")
+                return []
+
+        # Ensure timestamps and update cache
         for tx in txs:
             if 'blockNumber' in tx and 'timeStamp' not in tx:
                 tx['timeStamp'] = get_block_timestamp(tx['blockNumber'])
@@ -851,8 +971,10 @@ def fetch_bscscan_transactions(startblock: Optional[int] = None,
             last_block_number = max(tx['blockNumber'] for tx in txs)
             transaction_cache = (transaction_cache + txs)[-1000:]
             last_transaction_fetch = datetime.now().timestamp() * 1000
+            logger.info(f"✅ Fetched {len(txs)} buy transactions, last_block_number={last_block_number}")
+        else:
+            logger.info(f"No new transactions found")
 
-        logger.info(f"✅ Fetched {len(txs)} buy transactions, last_block_number={last_block_number}")
         return txs
 
     except Exception as e:
