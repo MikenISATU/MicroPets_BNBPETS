@@ -818,23 +818,29 @@ def fetch_bscscan_transactions(startblock: Optional[int] = None,
         if startblock is None:
             startblock = max(1, endblock - LOG_WINDOW_SIZE)
 
-        # Try BscScan API first if API key is available
+        # Use ONLY BscScan API - it's the only reliable method
         txs = []
-        if BSCSCAN_API_KEY:
-            try:
-                logger.info(f"🔍 Using BscScan API (preferred method)")
-                txs = fetch_transactions_via_bscscan_api(startblock, endblock)
-            except Exception as api_error:
-                logger.warning(f"BscScan API failed: {api_error}, falling back to Web3 RPC")
-                txs = []
+        if not BSCSCAN_API_KEY:
+            logger.error("="*60)
+            logger.error("❌ CRITICAL: BscScan API key is required!")
+            logger.error("="*60)
+            logger.error("🔑 Get a FREE BscScan API key:")
+            logger.error("   1. Go to: https://bscscan.com/myapikey")
+            logger.error("   2. Create account (FREE)")
+            logger.error("   3. Generate API key")
+            logger.error("   4. Add to Railway: ETHERSCAN_API_KEY=YourKey")
+            logger.error("="*60)
+            logger.error("⏸️  Transaction monitoring PAUSED until API key is added")
+            logger.error("="*60)
+            return []
 
-        # Fallback to Web3 RPC if BscScan API failed or no API key
-        if not txs and not BSCSCAN_API_KEY:
-            logger.info(f"⚠️ No BscScan API key, using Web3 RPC (slower, may hit rate limits)")
-            txs = fetch_transactions_via_web3(from_block=startblock, to_block=endblock)
-        elif not txs:
-            logger.info(f"🔄 Falling back to Web3 RPC")
-            txs = fetch_transactions_via_web3(from_block=startblock, to_block=endblock)
+        try:
+            logger.info(f"📡 Fetching transactions via BscScan API")
+            txs = fetch_transactions_via_bscscan_api(startblock, endblock)
+        except Exception as api_error:
+            logger.error(f"❌ BscScan API failed: {api_error}")
+            logger.error(f"⏸️  Will retry on next polling interval")
+            return []
 
         # Ensure timestamps are present
         for tx in txs:
